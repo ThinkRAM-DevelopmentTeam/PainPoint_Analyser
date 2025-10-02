@@ -1,3 +1,41 @@
+# --------------------------------------------------------------------------
+# This file lists all the Python packages required to run the application.
+# You can install all of them at once by running:
+# pip install -r requirements.txt
+# --------------------------------------------------------------------------
+
+# Core web framework for building the API endpoints (/business-search, /chat).
+fastapi
+
+# ASGI server that runs the FastAPI application, allowing it to handle web traffic.
+# The '[standard]' part includes recommended extras for better performance.
+uvicorn[standard]
+
+# A modern, asynchronous HTTP client used to make fast API calls to the
+# Google Places API. It's crucial for the `async` and `await` functionality.
+httpx
+
+# Library for processing textual data. We use it specifically for its simple
+# and effective sentiment analysis to identify "pain points" in reviews.
+textblob
+
+# Automatically loads environment variables from a `.env` file into the application's
+# environment. This is how we securely manage API keys without hardcoding them.
+python-dotenv
+
+# An add-on for Pydantic that allows easy management of application settings,
+# especially for loading variables from the .env file in Pydantic v2.
+pydantic-settings
+
+# The official Python client library for interacting with the OpenAI API.
+# This is used for the /chat endpoint to send data to GPT models.
+openai
+
+# A library providing various caching mechanisms. We use its TTLCache (Time-to-Live Cache)
+# to temporarily store results from the Google Places API, which significantly
+# reduces costs by preventing duplicate API calls.
+cachetools
+
 # main.py
 
 import os
@@ -184,4 +222,5 @@ async def chat_with_ai(request: ChatRequest):
         )
         return ChatResponse(answer=completion.choices[0].message.content)
     except Exception as e:
+
         raise HTTPException(status_code=500, detail=f"An error with OpenAI: {str(e)}")
