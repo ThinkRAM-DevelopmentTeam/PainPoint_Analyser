@@ -36,90 +36,159 @@ openai
 # reduces costs by preventing duplicate API calls.
 cachetools
 
+# NEW: Asynchronous PostgreSQL driver for connecting to Neon DB
+asyncpg
+asyncio-windows-events
+
 # main.py
 
 import os
 import httpx
 import asyncio
 import json
+import time
 from typing import List, Optional
 from enum import Enum
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from textblob import TextBlob
 from openai import OpenAI
-from cachetools import TTLCache # Import the caching library
+import asyncpg # Use the PostgreSQL database driver
+import asyncio
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # --- Configuration ---
 class Settings(BaseSettings):
     google_places_api_key: str
     openai_api_key: str
+    database_url: str
     model_config = SettingsConfigDict(env_file=".env")
 
 settings = Settings()
 openai_client = OpenAI(api_key=settings.openai_api_key)
 
-# --- Caching Setup ---
-# Create a cache that holds up to 500 items, and each item expires after 1 hour (3600 seconds)
-# This means if you search the same area again, you won't be re-charged for the same business details.
-details_cache = TTLCache(maxsize=500, ttl=3600)
+# --- FastAPI App Initialization ---
+# The app object needs to be defined before the lifespan events
+app = FastAPI(
+    title="Production-Grade Business Analyst AI",
+    description="Search businesses with persistent database caching to dramatically reduce long-term API costs. Features user-driven field selection and an AI analyst.",
+    version="7.0.0"
+)
 
-# --- Enum for Day of the Week Filter ---
+# --- Database Connection Pool ---
+# A pool is the standard way to manage database connections in a web app
+db_pool = None
+
+@app.on_event("startup")
+async def startup_event():
+    """On app startup, create a database connection pool."""
+    global db_pool
+    try:
+        db_pool = await asyncpg.create_pool(settings.database_url)
+        print("Database connection pool created successfully.")
+    except Exception as e:
+        print(f"FATAL: Could not connect to the database: {e}")
+        db_pool = None
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """On app shutdown, close the database connection pool."""
+    if db_pool:
+        await db_pool.close()
+        print("Database connection pool closed.")
+
+# --- Enums for User Selection ---
 class DayOfWeek(str, Enum):
     monday = "Monday"; tuesday = "Tuesday"; wednesday = "Wednesday"; thursday = "Thursday"
     friday = "Friday"; saturday = "Saturday"; sunday = "Sunday"
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="Cost-Optimized Business Analyst AI",
-    description="Search businesses, filter them efficiently to reduce API costs, and use an AI chatbot to analyze the results.",
-    version="4.0.0"
-)
+class DataField(str, Enum):
+    rating = "rating"
+    reviews = "reviews"
+    opening_hours = "opening_hours"
+    website = "website"
+    phone_number = "formatted_phone_number"
 
-# --- Pydantic Models (No changes here) ---
+# --- Pydantic Models ---
 class Review(BaseModel):
     author_name: str; rating: int; text: str; relative_time_description: str
 class PainPoint(BaseModel):
     sentiment_polarity: float; review_text: str
 class Business(BaseModel):
-    name: str; address: Optional[str]; phone: Optional[str]; website: Optional[str]
-    opening_hours: Optional[List[str]]; reviews: List[Review]; pain_points: List[PainPoint]
-    rating: Optional[float]; total_ratings: Optional[int]; google_maps_url: Optional[str]
+    name: str
+    address: Optional[str] = None
+    phone: Optional[str] = Field(None, alias="formatted_phone_number")
+    website: Optional[str] = None
+    opening_hours: Optional[List[str]] = None
+    reviews: List[Review] = []
+    pain_points: List[PainPoint] = []
+    rating: Optional[float] = None
+    total_ratings: Optional[int] = None
+    google_maps_url: Optional[str] = Field(None, alias="url")
+    data_source: Optional[str] = None
+    cached_at: Optional[datetime] = None
 class ChatRequest(BaseModel):
     business_data: List[Business]
     user_question: str = Field(..., example="Which business has the lowest rating?")
+    use_lean_payload: bool = Field(True, description="Send a summarized version of the data to the AI to reduce cost.")
 class ChatResponse(BaseModel):
     answer: str
 
 # --- Helper Functions ---
-async def search_nearby_places(client: httpx.AsyncClient, lat: float, lng: float, keyword: str, radius_m: int) -> list:
+async def search_nearby_places(client: httpx.AsyncClient, params: dict, desired_total_results: int) -> list:
+    all_places = []
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    params = {"key": settings.google_places_api_key, "location": f"{lat},{lng}", "radius": radius_m, "keyword": keyword}
-    response = await client.get(url, params=params)
-    response.raise_for_status()
-    return response.json().get("results", [])
+    while len(all_places) < desired_total_results:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        all_places.extend(data.get("results", []))
+        pagetoken = data.get("next_page_token")
+        if not pagetoken or len(all_places) >= desired_total_results:
+            break
+        params["pagetoken"] = pagetoken
+        await asyncio.sleep(2)
+    return all_places[:desired_total_results]
 
-# UPDATED get_place_details to use the cache
 async def get_place_details(client: httpx.AsyncClient, place_id: str) -> dict:
-    """Gets details for a place, using a cache to avoid duplicate API calls."""
-    if place_id in details_cache:
-        return details_cache[place_id] # Return from cache if available
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database connection is not available.")
+    async with db_pool.acquire() as connection:
+        record = await connection.fetchrow("SELECT details_json, fetched_at FROM places_cache WHERE place_id = $1", place_id)
+        if record:
+            age = datetime.now(timezone.utc) - record['fetched_at']
+            if age < timedelta(days=30):
+                print(f"Cache HIT for place_id: {place_id}")
+                cached_data = json.loads(record['details_json'])
+                cached_data['data_source'] = f"Database Cache (fetched on {record['fetched_at'].date()})"
+                cached_data['cached_at'] = record['fetched_at']
+                return cached_data
+            print(f"Cache STALE for place_id: {place_id}. Data is {age.days} days old. Refetching.")
     
+    print(f"Cache MISS for place_id: {place_id}. Calling Google API.")
     url = "https://maps.googleapis.com/maps/api/place/details/json"
-    params = {"key": settings.google_places_api_key, "place_id": place_id, "fields": "name,formatted_address,formatted_phone_number,website,opening_hours,reviews,rating,user_ratings_total,url"}
+    full_fields = "place_id,name,formatted_address,rating,user_ratings_total,url,formatted_phone_number,website,reviews,opening_hours"
+    params = {"key": settings.google_places_api_key, "place_id": place_id, "fields": full_fields}
     response = await client.get(url, params=params)
     response.raise_for_status()
     result = response.json().get("result", {})
-    
     if result:
-        details_cache[place_id] = result # Store successful result in cache
+        result_json = json.dumps(result)
+        current_time = datetime.now(timezone.utc)
+        async with db_pool.acquire() as connection:
+            await connection.execute("""
+                INSERT INTO places_cache (place_id, details_json, fetched_at) VALUES ($1, $2, $3)
+                ON CONFLICT (place_id) DO UPDATE SET details_json = $2, fetched_at = $3;
+            """, place_id, result_json, current_time)
+        result['data_source'] = "Live Google API (and saved to cache)"
+        result['cached_at'] = current_time
     return result
 
 def analyze_reviews_for_pain_points(reviews: Optional[List[dict]]) -> List[PainPoint]:
     if not reviews: return []
-    # ... (code unchanged)
     pain_points = []
     for review in reviews:
         text = review.get("text")
@@ -129,72 +198,84 @@ def analyze_reviews_for_pain_points(reviews: Optional[List[dict]]) -> List[PainP
             pain_points.append(PainPoint(sentiment_polarity=analysis.sentiment.polarity, review_text=text))
     return pain_points
 
-# --- API Endpoint: Business Search (Completely Reworked for Cost Optimization) ---
-@app.get("/business-search", response_model=List[Business], summary="Cost-optimized business search with advanced filtering")
+# --- API Endpoints ---
+@app.get("/business-search", response_model=List[Business], summary="Select fields, then filter (with DB Caching)")
 async def business_search(
     keyword: str = Query(..., example="restaurant"), lat: float = Query(..., example=40.7128),
     lng: float = Query(..., example=-74.0060), radius_m: int = Query(5000, gt=0),
-    has_pain_points: Optional[bool] = Query(None), min_rating: Optional[float] = Query(None, ge=1, le=5),
-    max_rating: Optional[float] = Query(None, ge=1, le=5), min_reviews: Optional[int] = Query(None, ge=0),
-    open_on_day: Optional[DayOfWeek] = Query(None)
+    fields: List[DataField] = Query(..., description="Select data fields. Determines which filters you can use."),
+    desired_total_results: int = Query(20, description="Total number of initial results to fetch (max 60).", ge=1, le=60),
+    has_pain_points: Optional[bool] = Query(None), min_rating: Optional[float] = Query(None),
+    max_rating: Optional[float] = Query(None), min_reviews: Optional[int] = Query(None),
+    open_on_day: Optional[DayOfWeek] = Query(None),
+    max_results_to_process: Optional[int] = Query(10, description="Limit processing to the top N results for cost control.")
 ):
-    if not settings.google_places_api_key or "YOUR_GOOGLE_API_KEY" in settings.google_places_api_key:
-        raise HTTPException(status_code=500, detail="Google Places API key is not configured.")
+    # --- Backend Validation ---
+    if (min_rating is not None or max_rating is not None or min_reviews is not None) and DataField.rating not in fields:
+        raise HTTPException(status_code=400, detail="To filter by rating/reviews, you must select the 'rating' field.")
+    if has_pain_points and DataField.reviews not in fields:
+        raise HTTPException(status_code=400, detail="To use 'has_pain_points' filter, you must select the 'reviews' field.")
+    if open_on_day and DataField.opening_hours not in fields:
+        raise HTTPException(status_code=400, detail="To filter by 'open_on_day', you must select the 'opening_hours' field.")
 
     async with httpx.AsyncClient() as client:
         try:
-            # --- STAGE 1: Initial (Cheaper) Search ---
-            nearby_places = await search_nearby_places(client, lat, lng, keyword, radius_m)
-
-            # --- STAGE 2: PRE-FILTERING (Cost-Saving Step) ---
-            # Apply filters that don't require the expensive "Details" call.
+            # --- STAGE 1: Paginated Search ---
+            search_params = {"key": settings.google_places_api_key, "location": f"{lat},{lng}", "radius": radius_m, "keyword": keyword}
+            nearby_places = await search_nearby_places(client, search_params, desired_total_results)
+            
+            # --- STAGE 2: Pre-filtering ---
             pre_filtered_place_ids = []
-            for place in nearby_places:
-                rating = place.get("rating")
-                total_ratings = place.get("user_ratings_total")
-                
-                if min_rating is not None and (rating is None or rating < min_rating):
-                    continue
-                if max_rating is not None and (rating is None or rating > max_rating):
-                    continue
-                if min_reviews is not None and (total_ratings is None or total_ratings < min_reviews):
-                    continue
-                
-                pre_filtered_place_ids.append(place["place_id"])
+            if DataField.rating in fields:
+                for place in nearby_places:
+                    if min_rating and (place.get("rating") is None or place.get("rating") < min_rating): continue
+                    if max_rating and (place.get("rating") is None or place.get("rating") > max_rating): continue
+                    if min_reviews and (place.get("user_ratings_total") is None or place.get("user_ratings_total") < min_reviews): continue
+                    pre_filtered_place_ids.append(place["place_id"])
+            else:
+                pre_filtered_place_ids = [p["place_id"] for p in nearby_places]
 
-            # --- STAGE 3: DETAILED FETCH (Expensive Step on a smaller list) ---
-            # Now, only get full details for the places that passed the pre-filter.
-            tasks = [get_place_details(client, place_id) for place_id in pre_filtered_place_ids]
+            limited_place_ids = pre_filtered_place_ids[:max_results_to_process]
+            
+            # --- STAGE 3: Detailed Fetch (Now using the DB-aware function) ---
+            tasks = [get_place_details(client, place_id) for place_id in limited_place_ids]
             place_details_list = await asyncio.gather(*tasks)
 
-            # --- STAGE 4: FINAL FILTERING AND RESPONSE ---
+            # --- STAGE 4: Final Filtering ---
             final_results = []
             for details in place_details_list:
                 if not details: continue
+                # Apply filters based on the rich data from the cache/API
+                if DataField.rating in fields:
+                    if min_rating and (details.get("rating") is None or details.get("rating") < min_rating): continue
+                    if max_rating and (details.get("rating") is None or details.get("rating") > max_rating): continue
+                    if min_reviews and (details.get("user_ratings_total") is None or details.get("user_ratings_total") < min_reviews): continue
                 
                 reviews_data = details.get("reviews", [])
                 pain_points = analyze_reviews_for_pain_points(reviews_data)
-
-                # Final filter for pain points
-                if has_pain_points is not None and has_pain_points and not pain_points:
-                    continue
+                if has_pain_points and not pain_points: continue
                 
-                # Final filter for opening day
                 opening_hours = details.get("opening_hours", {}).get("weekday_text", [])
-                if open_on_day is not None:
-                    if not opening_hours: continue
-                    is_open = any(day.startswith(open_on_day.value) and "Closed" not in day for day in opening_hours)
-                    if not is_open:
-                        continue
+                if open_on_day and not any(day.startswith(open_on_day.value) and "Closed" not in day for day in opening_hours): continue
                 
-                business_info = Business(
-                    name=details.get("name"), address=details.get("formatted_address"), phone=details.get("formatted_phone_number"),
-                    website=details.get("website"), opening_hours=opening_hours,
-                    reviews=[Review(**review) for review in reviews_data] if reviews_data else [],
-                    pain_points=pain_points, rating=details.get("rating"), total_ratings=details.get("user_ratings_total"),
-                    google_maps_url=details.get("url")
-                )
-                final_results.append(business_info)
+                # Only include fields the user actually asked for in the final response
+                requested_business_data = {
+                    "data_source": details.get("data_source"), "cached_at": details.get("cached_at"),
+                    "name": details.get("name"), "address": details.get("formatted_address"),
+                    "google_maps_url": details.get("url")
+                }
+                if DataField.rating in fields:
+                    requested_business_data.update({"rating": details.get("rating"), "total_ratings": details.get("user_ratings_total")})
+                if DataField.reviews in fields:
+                    requested_business_data.update({"reviews": reviews_data, "pain_points": pain_points})
+                if DataField.opening_hours in fields:
+                    requested_business_data.update({"opening_hours": opening_hours})
+                if DataField.website in fields:
+                    requested_business_data.update({"website": details.get("website")})
+                if DataField.phone_number in fields:
+                    requested_business_data.update({"phone": details.get("formatted_phone_number")})
+
+                final_results.append(Business(**requested_business_data))
 
             return final_results
         except httpx.HTTPStatusError as exc:
@@ -203,14 +284,26 @@ async def business_search(
             raise HTTPException(status_code=500, detail=f"An unexpected error: {str(e)}")
 
 
-# --- Chat Endpoint (No changes needed here) ---
-@app.post("/chat", response_model=ChatResponse, summary="Chat with an AI to analyze business data")
+# --- Chat Endpoint (Unchanged from the previous version) ---
+@app.post("/chat", response_model=ChatResponse, summary="Chat with an AI with user-controlled payload optimization")
 async def chat_with_ai(request: ChatRequest):
-    # ... (code unchanged)
     if not openai_client:
-        raise HTTPException(status_code=500, detail="OpenAI client is not initialized. Check your OPENAI_API_KEY.")
-    business_data_json = json.dumps([b.model_dump() for b in request.business_data], indent=2)
-    system_prompt = "You are a helpful business analyst. Answer questions ONLY based on the JSON data provided. If info is not in the data, say it's not available."
+        raise HTTPException(status_code=500, detail="OpenAI client is not initialized.")
+    
+    if request.use_lean_payload:
+        lean_business_data = []
+        for business in request.business_data:
+            lean_business_data.append({
+                "name": business.name, "rating": business.rating, "total_ratings": business.total_ratings,
+                "pain_points": [p.review_text for p in business.pain_points],
+                "phone": business.phone, "website": business.website, "address": business.address
+            })
+        business_data_json = json.dumps(lean_business_data, indent=2)
+        system_prompt = "You are a helpful business analyst. Answer questions ONLY based on the summarized JSON data provided. If info is not in the data, say it's not available."
+    else:
+        business_data_json = json.dumps([b.model_dump() for b in request.business_data], indent=2)
+        system_prompt = "You are a helpful business analyst. Answer questions ONLY based on the complete JSON data provided. Do not make up information. If info is not in the data, say it's not available."
+
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4o",
@@ -222,5 +315,4 @@ async def chat_with_ai(request: ChatRequest):
         )
         return ChatResponse(answer=completion.choices[0].message.content)
     except Exception as e:
-
         raise HTTPException(status_code=500, detail=f"An error with OpenAI: {str(e)}")
