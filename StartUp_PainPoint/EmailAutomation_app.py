@@ -1,3 +1,17 @@
+#requirement installs: pip install streamlit psycopg2 resend # streamlit
+# psycopg2-binary
+# resend
+# requests
+# openai
+# beautifulsoup4
+# langchain-google-genai
+# langchain
+# langchain-community
+# langchain-core
+# langchain-text-splitters
+# langchain-openai
+
+
 import streamlit as st
 import psycopg2
 import json
@@ -278,4 +292,5 @@ if st.session_state.get('recipients'):
                     for k in list(st.session_state.keys()):
                         if k.startswith('select_'):
                             del st.session_state[k]
+
                     st.rerun()
