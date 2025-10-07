@@ -1,3 +1,15 @@
+# requirements.txt
+
+#streamlit==1.33.0
+#psycopg2-binary==2.9.9
+#resend==0.7.0
+#requests==2.31.0
+#openai==1.16.2
+#beautifulsoup4==4.12.3
+#textblob==0.18.0.post0 
+
+
+
 import streamlit as st
 import psycopg2
 import json
@@ -542,3 +554,4 @@ with tab2:
                         keys_to_del = [k for k in st.session_state if k.startswith(('select_', 'searched_'))]
                         for k in keys_to_del: del st.session_state[k]
                         st.rerun()
+
